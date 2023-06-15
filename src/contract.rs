@@ -1,13 +1,12 @@
 #[cfg(not(feature = "library"))]
 use cosmwasm_std::entry_point;
 use cosmwasm_std::{
-    to_binary, Binary, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult,
+    to_binary, Addr, Binary, Deps, DepsMut, Env, Event, MessageInfo, Response, StdResult,
 };
-// use cw2::set_contract_version;
 
 use crate::error::ContractError;
 use crate::msg::{ExecuteMsg, InstantiateMsg, QueryMsg};
-use crate::state::{Transaction, ADMINS, QUORUM};
+use crate::state::{PendingTransactions, Transaction, ADMINS, PENDING_TXS, QUORUM, SIGNED_TX};
 
 #[cfg_attr(not(feature = "library"), entry_point)]
 pub fn instantiate(
@@ -29,6 +28,9 @@ pub fn instantiate(
 
     ADMINS.save(deps.storage, &msg.owners)?;
     QUORUM.save(deps.storage, &msg.quorum)?;
+    let pending = PendingTransactions::new(Vec::new());
+    PENDING_TXS.save(deps.storage, &pending)?;
+    SIGNED_TX.save(deps.storage, (Addr::unchecked("test"), 0), &false)?;
 
     let events = msg
         .owners
@@ -72,9 +74,14 @@ mod exec {
 
         let mut pending_txs = PENDING_TXS.load(deps.storage)?;
         let next_id = pending_txs.next_id();
-        let tx = Transaction::new(to, next_id, coins);
+        let mut tx = Transaction::new(to, next_id, coins);
+        tx.num_confirmations = 1;
         pending_txs.push(tx.clone());
         PENDING_TXS.save(deps.storage, &pending_txs)?;
+
+        // Since the user proposed the tx he already approves that it will be executed,
+        // This way he won't have to approve the transaction again
+        SIGNED_TX.save(deps.storage, (info.sender, next_id), &true)?;
         Ok(Response::new().add_event(Event::new("new_tx").add_attribute("tx", tx.to_string())))
     }
 
@@ -83,12 +90,10 @@ mod exec {
         info: MessageInfo,
         tx_id: u32,
     ) -> Result<Response, ContractError> {
-        let signed = SIGNED_TX
-            .load(deps.storage, (info.sender.clone(), tx_id))
-            .map_err(|_| ContractError::NonExistentTx(tx_id))?;
-
-        if signed {
-            return Err(ContractError::AlreadySigned(tx_id));
+        if let Ok(signed) = SIGNED_TX.load(deps.storage, (info.sender.clone(), tx_id)) {
+            if signed {
+                return Err(ContractError::AlreadySigned(tx_id));
+            }
         }
 
         SIGNED_TX.save(deps.storage, (info.sender, tx_id), &true)?;
@@ -100,6 +105,8 @@ mod exec {
             .ok_or(ContractError::NonExistentTx(tx_id))?;
 
         tx.num_confirmations += 1;
+
+        PENDING_TXS.save(deps.storage, &pending_txs)?;
 
         Ok(Response::new())
     }
@@ -113,7 +120,7 @@ mod exec {
 
         let quorum = QUORUM.load(deps.storage)?;
 
-        if quorum < tx.num_confirmations {
+        if quorum > tx.num_confirmations {
             return Err(ContractError::NotEnoughSignatures {
                 quorum,
                 num_signed: tx.num_confirmations,
@@ -176,4 +183,254 @@ mod query {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use crate::msg::{ListPendingResp, ListSignedResp};
+
+    use super::*;
+    use cosmwasm_std::{coins, Addr, Coin};
+    use cw_multi_test::{App, ContractWrapper, Executor};
+
+    fn instantiate_contract() -> (Addr, App) {
+        let mut app = App::new(|router, _, storage| {
+            router
+                .bank
+                .init_balance(storage, &Addr::unchecked("owner"), coins(5, "atom"))
+                .unwrap();
+        });
+
+        let code = ContractWrapper::new(execute, instantiate, query);
+        let code_id = app.store_code(Box::new(code));
+
+        let coin = Coin::new(5, "atom");
+
+        let addr = app
+            .instantiate_contract(
+                code_id,
+                Addr::unchecked("owner"),
+                &InstantiateMsg {
+                    owners: vec![
+                        Addr::unchecked("owner1"),
+                        Addr::unchecked("owner2"),
+                        Addr::unchecked("owner3"),
+                    ],
+                    quorum: 2,
+                },
+                &[coin],
+                "Multisig",
+                None,
+            )
+            .unwrap();
+
+        (addr, app)
+    }
+
+    #[test]
+    fn test_instantiate() {
+        let (addr, app) = instantiate_contract();
+
+        let balance: Vec<Coin> = app.wrap().query_all_balances(&addr).unwrap();
+        assert_eq!(vec![Coin::new(5, "atom")], balance);
+    }
+
+    #[test]
+    #[should_panic(expected = "Unauthorized")]
+    fn test_propose_unauthorized() {
+        let (addr, mut app) = instantiate_contract();
+
+        let msg = ExecuteMsg::CreateTransaction {
+            to: Addr::unchecked("owner"),
+            coins: vec![Coin::new(5, "atom")],
+        };
+        app.execute_contract(Addr::unchecked("unathorized"), addr.clone(), &msg, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_propose() {
+        let (addr, mut app) = instantiate_contract();
+
+        let msg = ExecuteMsg::CreateTransaction {
+            to: Addr::unchecked("owner"),
+            coins: vec![Coin::new(5, "atom")],
+        };
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+        let msg = QueryMsg::ListPending {};
+
+        let resp: ListPendingResp = app.wrap().query_wasm_smart(addr, &msg).unwrap();
+        let mut tx = Transaction::new(Addr::unchecked("owner"), 0, vec![Coin::new(5, "atom")]);
+        tx.num_confirmations = 1;
+        assert_eq!(&tx, resp.transactions.index(0).unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "You already signed transaction with id: 0")]
+    fn test_sign_after_already_signed() {
+        let (addr, mut app) = instantiate_contract();
+
+        let msg = ExecuteMsg::CreateTransaction {
+            to: Addr::unchecked("owner"),
+            coins: vec![Coin::new(5, "atom")],
+        };
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let msg = ExecuteMsg::SignTransactions { tx_id: 0 };
+
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_sign() {
+        let (addr, mut app) = instantiate_contract();
+
+        let msg = ExecuteMsg::CreateTransaction {
+            to: Addr::unchecked("owner"),
+            coins: vec![Coin::new(5, "atom")],
+        };
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let msg = ExecuteMsg::SignTransactions { tx_id: 0 };
+
+        app.execute_contract(Addr::unchecked("owner2"), addr.clone(), &msg, &[])
+            .unwrap();
+        app.execute_contract(Addr::unchecked("owner3"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let resp_owner1: ListSignedResp = app
+            .wrap()
+            .query_wasm_smart(
+                addr.clone(),
+                &QueryMsg::ListSigned {
+                    admin: Addr::unchecked("owner2"),
+                    tx_id: 0,
+                },
+            )
+            .unwrap();
+
+        let resp_owner2: ListSignedResp = app
+            .wrap()
+            .query_wasm_smart(
+                addr.clone(),
+                &QueryMsg::ListSigned {
+                    admin: Addr::unchecked("owner2"),
+                    tx_id: 0,
+                },
+            )
+            .unwrap();
+
+        let resp_owner3: ListSignedResp = app
+            .wrap()
+            .query_wasm_smart(
+                addr.clone(),
+                &QueryMsg::ListSigned {
+                    admin: Addr::unchecked("owner3"),
+                    tx_id: 0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resp_owner1.signed, true);
+        assert_eq!(resp_owner2.signed, true);
+        assert_eq!(resp_owner3.signed, true);
+
+        let resp: ListPendingResp = app
+            .wrap()
+            .query_wasm_smart(addr, &QueryMsg::ListPending {})
+            .unwrap();
+
+        assert_eq!(resp.transactions.index(0).unwrap().num_confirmations, 3);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Not enough admins signed this transaction, the quorum is 2 and only 1 signed the transaction"
+    )]
+    fn test_execute_under_quorum() {
+        let (addr, mut app) = instantiate_contract();
+
+        let msg = ExecuteMsg::CreateTransaction {
+            to: Addr::unchecked("owner"),
+            coins: vec![Coin::new(5, "atom")],
+        };
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let msg = ExecuteMsg::ExecuteTransaction { tx_id: 0 };
+
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_execute() {
+        let (addr, mut app) = instantiate_contract();
+
+        let msg = ExecuteMsg::CreateTransaction {
+            to: Addr::unchecked("owner"),
+            coins: vec![Coin::new(5, "atom")],
+        };
+        app.execute_contract(Addr::unchecked("owner1"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let msg = ExecuteMsg::SignTransactions { tx_id: 0 };
+
+        app.execute_contract(Addr::unchecked("owner2"), addr.clone(), &msg, &[])
+            .unwrap();
+        app.execute_contract(Addr::unchecked("owner3"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let resp_owner1: ListSignedResp = app
+            .wrap()
+            .query_wasm_smart(
+                addr.clone(),
+                &QueryMsg::ListSigned {
+                    admin: Addr::unchecked("owner2"),
+                    tx_id: 0,
+                },
+            )
+            .unwrap();
+
+        let resp_owner2: ListSignedResp = app
+            .wrap()
+            .query_wasm_smart(
+                addr.clone(),
+                &QueryMsg::ListSigned {
+                    admin: Addr::unchecked("owner2"),
+                    tx_id: 0,
+                },
+            )
+            .unwrap();
+
+        let resp_owner3: ListSignedResp = app
+            .wrap()
+            .query_wasm_smart(
+                addr.clone(),
+                &QueryMsg::ListSigned {
+                    admin: Addr::unchecked("owner3"),
+                    tx_id: 0,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resp_owner1.signed, true);
+        assert_eq!(resp_owner2.signed, true);
+        assert_eq!(resp_owner3.signed, true);
+
+        let msg = ExecuteMsg::ExecuteTransaction { tx_id: 0 };
+
+        app.execute_contract(Addr::unchecked("owner3"), addr.clone(), &msg, &[])
+            .unwrap();
+
+        let balance: Coin = app.wrap().query_balance(&addr, "atom").unwrap();
+        assert_eq!(Coin::new(0, "atom"), balance);
+
+        let balance: Coin = app
+            .wrap()
+            .query_balance(&Addr::unchecked("owner"), "atom")
+            .unwrap();
+        assert_eq!(Coin::new(5, "atom"), balance);
+    }
+}

@@ -43,9 +43,17 @@ impl ToString for Transaction {
 }
 
 #[cw_serde]
-pub struct PendingTransactions(Vec<Transaction>);
+pub struct PendingTransactions(pub Vec<Transaction>);
 
 impl PendingTransactions {
+    pub fn new(txs: Vec<Transaction>) -> Self {
+        Self(txs)
+    }
+
+    pub fn index(&self, index: u32) -> Option<&Transaction> {
+        self.0.iter().nth(index as usize)
+    }
+
     pub fn next_id(&self) -> u32 {
         self.0.len() as u32
     }
